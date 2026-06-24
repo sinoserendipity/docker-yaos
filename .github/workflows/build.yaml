@@ -133,7 +133,7 @@ jobs:
       - name: Build image (local, for smoke test)
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: ./server
           load: true
           tags: yaos-server:smoke-test
           cache-from: type=gha
