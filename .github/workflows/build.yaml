@@ -1,60 +1,73 @@
 name: Build and Push Docker Image
 
+# ── 触发条件 ──────────────────────────────────
+# 只有当 push 到 main 分支或推送 v* 标签时才构建发布版本
 on:
   push:
     branches: [main]
     tags: ["v*"]
+  # PR 只触发构建+烟雾测试，不推镜像（见下方条件判断）
   pull_request:
     branches: [main]
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  REGISTRY: ghcr.io                     # 镜像仓库：GitHub Container Registry
+  IMAGE_NAME: ${{ github.repository }}  # 镜像名：owner/repo
 
 jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
-      packages: write
+      contents: read   # 读取代码
+      packages: write  # 推送到 ghcr.io
+
+    # ── 全局默认工作目录 ──────────────────────
+    # 所有 run: 步骤都自动在 server/ 下执行，不用每个 step 都写 cd server
     defaults:
       run:
         working-directory: ./server
 
     steps:
-      - name: Checkout
+      # ═══════════════════════════════════════
+      # 1. 环境准备
+      # ═══════════════════════════════════════
+
+      - name: 拉取代码
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
+      - name: 配置 Node.js + npm 缓存
         uses: actions/setup-node@v4
         with:
           node-version: "20"
           cache: "npm"
-          cache-dependency-path: server/package-lock.json
+          cache-dependency-path: server/package-lock.json  # lock 文件在 server/ 下面
 
-      - name: Install dependencies
+      - name: 安装项目依赖
         run: npm ci
 
-      - name: Typecheck
+      - name: TypeScript 类型检查
         run: npm run typecheck
 
-      - name: Cache selflare
+      # ═══════════════════════════════════════
+      # 2. Workerd 编译
+      # ═══════════════════════════════════════
+      # 把 Cloudflare Worker 编译为 workerd 可执行的 Cap'n Proto 格式
+      # 然后生成对应的 Dockerfile 和 docker-compose.yml
+
+      - name: 缓存 selflare 编译工具
         uses: actions/cache@v4
         with:
           path: /usr/local/lib/node_modules/selflare
           key: selflare-${{ hashFiles('package-lock.json') }}
           restore-keys: selflare-
 
-      - name: Install selflare (if not cached)
+      - name: 安装 selflare（缓存未命中时才装）
         run: |
           npm ls -g selflare 2>/dev/null || npm install -g selflare
 
-      # selflare's default -d list only covers cache/kv/d1/r2. This worker
-      # (wrangler.toml) only declares Durable Object bindings, so the only
-      # storage directory that actually matters is do:storage. selflare
-      # ignores -d mappings for bindings the worker doesn't use, so it's
-      # safe to pass all five every time even as the worker evolves.
-      - name: Compile worker to Cap'n Proto
+      # selflare 默认只认 cache/kv/d1/r2，不认 do（Durable Object）
+      # 但多余的 -d 参数不会报错，所以全部写上保证覆盖
+      - name: 编译 Worker → Cap'n Proto
         run: |
           selflare compile \
             -d cache:storage=./cache \
@@ -63,25 +76,34 @@ jobs:
             -d r2:storage=./r2 \
             -d do:storage=./do
 
-      - name: Generate Dockerfile and docker-compose.yml
+      - name: 生成 Dockerfile 和 docker-compose.yml
         run: selflare docker
 
-      - name: Set up Docker Buildx
+      # ═══════════════════════════════════════
+      # 3. 构建本地镜像 + 烟雾测试
+      # ═══════════════════════════════════════
+      # 先用同样的 Dockerfile 在 CI 里构建一个临时镜像，
+      # 启动容器并检查 /api/capabilities 是否返回合法 JSON，
+      # 确保编译产物能在 workerd 中正常运行
+
+      - name: 配置 Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build image (local, for smoke test)
+      - name: 构建临时镜像（本地加载，不推）
         uses: docker/build-push-action@v6
         with:
           context: ./server
-          load: true
+          load: true                       # 只在本地保留镜像
           tags: yaos-server:smoke-test
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Smoke test container
+      - name: 烟雾测试 —— 启动容器并验证 Worker 正常响应
         run: |
+          # 创建 workerd 需要的存储目录（空目录也没关系）
           mkdir -p .storage/{cache,kv,d1,r2,do}
 
+          # 用绑定挂载把这些目录传给容器，workerd 就能持久化写入
           docker run -d --name yaos-smoke \
             -p 8080:8080 \
             -v "$(pwd)/.storage/cache:/worker/cache" \
@@ -91,44 +113,51 @@ jobs:
             -v "$(pwd)/.storage/do:/worker/do" \
             yaos-server:smoke-test
 
-          echo "Waiting for worker to come up..."
+          echo "等待 Worker 启动..."
           for i in $(seq 1 30); do
+            # 容器退出则立刻报错并打印日志
             if ! docker inspect yaos-smoke --format '{{.State.Running}}' | grep -q true; then
-              echo "Container exited on attempt $i — showing logs:"
+              echo "容器在第 $i 次尝试时已退出 —— 打印日志:"
               docker logs yaos-smoke
               exit 1
             fi
 
             if curl -fsS http://localhost:8080/ -o /tmp/home.html 2>/dev/null; then
-              echo "Worker responded on attempt $i"
+              echo "Worker 在第 $i 次尝试时成功响应"
               break
             fi
 
             if [ "$i" -eq 30 ]; then
-              echo "Worker never responded after 30 attempts"
+              echo "30 次尝试后 Worker 仍未响应"
               docker logs yaos-smoke
               exit 1
             fi
             sleep 1
           done
 
-          echo "--- / response (first 20 lines) ---"
+          echo "--- 首页响应（前20行） ---"
           head -20 /tmp/home.html
 
           echo "--- /api/capabilities ---"
           curl -fsS http://localhost:8080/api/capabilities | tee /tmp/capabilities.json
           echo
 
+          # 检查 capabilities 返回的是不是合法 JSON
           node -e "JSON.parse(require('fs').readFileSync('/tmp/capabilities.json', 'utf8'))"
 
-          echo "--- container logs ---"
+          echo "--- 容器日志 ---"
           docker logs yaos-smoke
 
-      - name: Tear down smoke test container
-        if: always()
+      - name: 清理烟雾测试容器
+        if: always()   # 即使前面步骤失败了也执行清理
         run: docker rm -f yaos-smoke || true
 
-      - name: Log in to GitHub Container Registry
+      # ═══════════════════════════════════════
+      # 4. 推送正式镜像到 ghcr.io
+      # ═══════════════════════════════════════
+      # 只有 push 到 main 或推标签时才执行，PR 不跑这步
+
+      - name: 登录 GitHub Container Registry
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
@@ -136,7 +165,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and Push Docker image
+      - name: 构建并推送 Docker 镜像
         if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v6
         with:
