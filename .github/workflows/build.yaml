@@ -125,16 +125,6 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_ENV"
 
-      # selflare docker only creates /worker/{cache,kv,d1,r2} dirs in the
-      # Dockerfile. Add mkdir for all possible storage bindings — mkdir -p
-      # is a no-op for dirs that already exist, so it's always safe.
-      - name: Ensure storage dirs in Dockerfile
-        run: |
-          cd server
-          sed -i '/^CMD\|^ENTRYPOINT/i RUN mkdir -p /worker/cache /worker/kv /worker/d1 /worker/r2 /worker/do' Dockerfile
-          echo "--- final Dockerfile ---"
-          cat Dockerfile
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
