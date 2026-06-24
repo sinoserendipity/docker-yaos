@@ -64,67 +64,6 @@ jobs:
           cd server
           selflare docker
 
-      # selflare docker always writes a fixed cache/kv/d1/r2 mount list and
-      # never includes "do", regardless of what worker.capnp actually
-      # declares — and it never drops a binding that genuinely isn't used
-      # either. Instead of hardcoding which bindings this worker has (which
-      # silently goes stale the moment a binding is added or removed), detect
-      # the real list directly from the compiled worker.capnp and regenerate
-      # the volumes section from it.
-      - name: Patch docker-compose.yml from actual worker.capnp bindings
-        run: |
-          cd server
-
-          BINDINGS=$(strings worker.capnp | grep -oE '^(cache|kv|d1|r2|do):storage$' | sort -u | sed -E 's/:storage$//')
-          echo "Detected storage bindings:"
-          echo "$BINDINGS"
-
-          if [ -n "$BINDINGS" ]; then
-            python3 - "$BINDINGS" <<'PYEOF'
-          import sys
-
-          names = [n for n in sys.argv[1].splitlines() if n.strip()]
-
-          with open("docker-compose.yml") as f:
-              lines = f.readlines()
-
-          out = []
-          i = 0
-          while i < len(lines):
-              line = lines[i]
-              if line.strip() == "volumes:":
-                  indent = line[: len(line) - len(line.lstrip(" "))]
-                  item_indent = indent + "    "
-                  # Skip selflare's original volumes: line and its list items.
-                  i += 1
-                  while i < len(lines) and lines[i].startswith(item_indent + "-"):
-                      i += 1
-                  if names:
-                      out.append(line)  # keep "volumes:"
-                      for n in names:
-                          out.append(f"{item_indent}- ./.storage/{n}:/worker/{n}\n")
-                  # else: drop "volumes:" entirely — an empty list parses as
-                  # null and docker compose rejects that.
-                  continue
-              out.append(line)
-              i += 1
-
-          with open("docker-compose.yml", "w") as f:
-              f.writelines(out)
-          PYEOF
-          fi
-
-          echo "--- final docker-compose.yml ---"
-          cat docker-compose.yml
-
-          # Export the same binding list for the smoke test step so the
-          # docker run command mounts exactly these dirs.
-          {
-            echo "STORAGE_BINDINGS<<EOF"
-            echo "$BINDINGS"
-            echo "EOF"
-          } >> "$GITHUB_ENV"
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -141,18 +80,15 @@ jobs:
         run: |
           cd server
 
-          MOUNT_ARGS=()
-          while IFS= read -r name; do
-            [ -z "$name" ] && continue
-            mkdir -p ".storage/${name}"
-            MOUNT_ARGS+=(-v "$(pwd)/.storage/${name}:/worker/${name}")
-          done <<< "$STORAGE_BINDINGS"
-
-          echo "Mount args: ${MOUNT_ARGS[*]}"
+          mkdir -p .storage/{cache,kv,d1,r2,do}
 
           docker run -d --name yaos-smoke \
             -p 8080:8080 \
-            "${MOUNT_ARGS[@]}" \
+            -v "$(pwd)/.storage/cache:/worker/cache" \
+            -v "$(pwd)/.storage/kv:/worker/kv" \
+            -v "$(pwd)/.storage/d1:/worker/d1" \
+            -v "$(pwd)/.storage/r2:/worker/r2" \
+            -v "$(pwd)/.storage/do:/worker/do" \
             yaos-server:smoke-test
 
           echo "Waiting for worker to come up..."
