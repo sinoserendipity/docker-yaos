@@ -75,6 +75,7 @@ jobs:
       # section from it.
       - name: Patch docker-compose.yml from actual worker.capnp bindings
         run: |
+          cd server
           BINDINGS=$(strings worker.capnp | grep -oE '^(cache|kv|d1|r2|do):storage$' | sort -u | sed -E 's/:storage$//')
           echo "Detected storage bindings:"
           echo "$BINDINGS"
